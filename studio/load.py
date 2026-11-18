@@ -35,6 +35,26 @@ def _cpu_times():
     return sum(v) - v[3] - v[4], sum(v)                                    # everything except idle and waiting on disk
 
 
+def _process_cpu_ticks() -> int:
+    """CPU ticks used by processes visible inside this environment."""
+    total = 0
+    try:
+        pids = os.listdir("/proc")
+    except OSError:
+        return 0
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid}/stat", encoding="ascii") as f:
+                raw = f.read()
+            fields = raw[raw.rfind(")") + 2:].split()
+            total += int(fields[11]) + int(fields[12])
+        except (OSError, ValueError, IndexError):
+            continue
+    return total
+
+
 def _ram_free_gb() -> float:
     if os.name == "nt":
         import ctypes
@@ -58,6 +78,7 @@ def _watch():
         last = _cpu_times()
     except Exception:  # noqa: BLE001 - a system whose processor we cannot measure (a Mac): leave that out, keep the rest
         last = None
+    proc_last = None
     while True:
         time.sleep(1)
         if last is not None:
@@ -65,9 +86,27 @@ def _watch():
                 now = _cpu_times()
                 used, total = now[0] - last[0], now[1] - last[1]
                 last = now
-                if total > 0:
-                    # smoothed over a few seconds, so one short spike neither holds people up nor lets too much in
+                if total > 0 and used > 0:
+                    # Normal system-wide CPU measurement.
                     _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * (100.0 * used / total)
+                else:
+                    # Android PRoot may expose a frozen /proc/stat.
+                    # Measure CPU ticks from processes visible inside this environment.
+                    proc_now = _process_cpu_ticks()
+                    mono_now = time.monotonic()
+                    if proc_last is not None:
+                        old_ticks, old_time = proc_last
+                        elapsed = mono_now - old_time
+                        if elapsed > 0:
+                            tick_rate = os.sysconf("SC_CLK_TCK")
+                            try:
+                                cpu_count = len(os.sched_getaffinity(0))
+                            except (AttributeError, OSError):
+                                cpu_count = os.cpu_count() or 1
+                            delta = max(0, proc_now - old_ticks)
+                            percent = 100.0 * delta / (tick_rate * elapsed * max(1, cpu_count))
+                            _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * min(100.0, percent)
+                    proc_last = (proc_now, mono_now)
             except Exception:  # noqa: BLE001
                 pass
         try:
